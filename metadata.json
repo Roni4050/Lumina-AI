@@ -1,5 +1,6 @@
 {
   "name": "Lumina Upscale AI",
   "description": "Professional-grade AI image upscaling and enhancement tool inspired by Topaz Gigapixel AI. Supports batch processing, multiple upscale factors, and high-quality export formats.",
-  "requestFramePermissions": []
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }
