@@ -35,10 +35,9 @@ const getApiUrl = (url: string) => {
   if (url.startsWith('http://') || url.startsWith('https://') || url.startsWith('data:')) {
     return url;
   }
-  const base = (import.meta as any).env.VITE_API_URL || '';
-  const cleanBase = base.endsWith('/') ? base.slice(0, -1) : base;
+  // Force same-origin relative URLs to avoid auth-proxy and CORS issues
   const cleanUrl = url.startsWith('/') ? url : `/${url}`;
-  return `${cleanBase}${cleanUrl}`;
+  return cleanUrl;
 };
 
 interface UploadedFile {

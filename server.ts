@@ -143,9 +143,16 @@ async function createServer() {
 
   app.use(cors());
 
+  const serverLogs: string[] = [];
+
   // Logging middleware
   app.use((req, res, next) => {
-    console.log(`${new Date().toISOString()} - ${req.method} ${req.url}`);
+    const logMsg = `${new Date().toISOString()} - ${req.method} ${req.url}`;
+    console.log(logMsg);
+    serverLogs.push(logMsg);
+    if (serverLogs.length > 100) {
+      serverLogs.shift();
+    }
     next();
   });
 
@@ -157,13 +164,29 @@ async function createServer() {
 
   app.get(["/api/health", "/api/health/"], (req, res) => {
     console.log("Health check requested");
+    const registeredRoutes: string[] = [];
+    try {
+      if (app._router && app._router.stack) {
+        app._router.stack.forEach((middleware: any) => {
+          if (middleware.route) {
+            registeredRoutes.push(`${Object.keys(middleware.route.methods).join(",").toUpperCase()} ${middleware.route.path}`);
+          }
+        });
+      }
+    } catch (e: any) {
+      registeredRoutes.push(`Error gathering routes: ${e.message}`);
+    }
+
     res.json({ 
       status: "ok", 
       uptime: process.uptime(), 
       timestamp: Date.now(),
       env: isVercel ? "Vercel" : "Local",
+      node_env: process.env.NODE_ENV,
       writable: writableBase,
-      sharp: !!sharp
+      sharp: !!sharp,
+      routes: registeredRoutes,
+      logs: serverLogs
     });
   });
 
