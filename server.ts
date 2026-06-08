@@ -8,6 +8,7 @@ import multer from "multer";
 import { spawn } from "child_process";
 import cors from "cors";
 import archiver from "archiver";
+import unzipper from "unzipper";
 import sizeOf from "image-size";
 import sharp from "sharp";
 
@@ -41,6 +42,86 @@ async function createServer() {
   const OUTPUTS_DIR = resolveWritable("outputs");
   const MODELS_DIR = resolveWritable("models");
   const ENGINE_DIR = resolveWritable("ai-engine");
+
+  // Helper to find file recursively and fuzzily (case-insensitive and stripping special/encoded characters)
+  const findFuzzyFile = (filePathOrBasename: string): string | null => {
+    try {
+      if (!filePathOrBasename) return null;
+      
+      // Decode URI components in case the filename is URL-encoded
+      let decoded = filePathOrBasename;
+      try {
+        decoded = decodeURIComponent(filePathOrBasename);
+      } catch (err) {
+        // use original if decoding fails
+      }
+
+      // Strip any query parameters or hashes
+      decoded = decoded.split(/[?#]/)[0];
+
+      const basename = path.basename(decoded);
+      if (!basename) return null;
+
+      const clean = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, "");
+      const filenameClean = clean(basename);
+      if (!filenameClean) return null;
+      
+      const searchDirs = [
+        path.join(writableBase, "outputs"),
+        path.join(writableBase, "uploads")
+      ];
+
+      const scanDir = (dir: string): string | null => {
+        if (!fs.existsSync(dir)) return null;
+        let list: string[] = [];
+        try {
+          list = fs.readdirSync(dir);
+        } catch {
+          return null;
+        }
+        
+        // Priority 1: Exact case-sensitive match
+        for (const item of list) {
+          const fullPath = path.join(dir, item);
+          let stat;
+          try {
+            stat = fs.statSync(fullPath);
+          } catch {
+            continue;
+          }
+          if (!stat.isDirectory() && item === basename) {
+            return fullPath;
+          }
+        }
+        
+        // Priority 2: Fuzzy clean match
+        for (const item of list) {
+          const fullPath = path.join(dir, item);
+          let stat;
+          try {
+            stat = fs.statSync(fullPath);
+          } catch {
+            continue;
+          }
+          if (stat.isDirectory()) {
+            const found = scanDir(fullPath);
+            if (found) return found;
+          } else if (clean(item) === filenameClean) {
+            return fullPath;
+          }
+        }
+        return null;
+      };
+
+      for (const dir of searchDirs) {
+        const found = scanDir(dir);
+        if (found) return found;
+      }
+    } catch (err) {
+      console.error("Fuzzy search error:", err);
+    }
+    return null;
+  };
 
   console.log(`Environment: ${isVercel ? 'Vercel' : 'Standard'}`);
   console.log(`Writable Base: ${writableBase}`);
@@ -181,20 +262,42 @@ async function createServer() {
   app.get(["/api/download", "/api/download/"], (req, res) => {
     const filePath = req.query.path as string;
     const inline = req.query.inline === 'true';
+    const customName = req.query.name as string;
     if (!filePath) return res.status(400).send("Path required");
     
-    const absolutePath = path.resolve(writableBase, filePath);
+    let absolutePath = path.resolve(writableBase, filePath);
     
     // Security check: ensure the path is within the writable base
-    if (!absolutePath.startsWith(writableBase)) {
+    const relative = path.relative(writableBase, absolutePath);
+    const isSafe = relative && !relative.startsWith('..') && !path.isAbsolute(relative);
+    
+    if (!isSafe) {
+      console.warn(`Blocked potentially malicious download attempt: filePath=[${filePath}]`);
       return res.status(403).send("Forbidden");
+    }
+
+    // Try fuzzy match if exact file path is not found directly on disk
+    if (!fs.existsSync(absolutePath)) {
+      const fuzzyPath = findFuzzyFile(absolutePath);
+      if (fuzzyPath) {
+        console.log(`Download route exact match failed. Fuzzy matched path: ${fuzzyPath}`);
+        absolutePath = fuzzyPath;
+      }
     }
 
     if (fs.existsSync(absolutePath)) {
       if (inline) {
         res.sendFile(absolutePath);
       } else {
-        res.download(absolutePath);
+        const downloadName = customName || path.basename(absolutePath);
+        console.log(`Serving download: ${absolutePath} as "${downloadName}"`);
+        res.download(absolutePath, downloadName, (err) => {
+          if (err) {
+            console.error(`Error during file download of ${absolutePath}:`, err);
+          } else {
+            console.log(`Download completed successfully: ${absolutePath}`);
+          }
+        });
       }
     } else {
       res.status(404).send("File not found");
@@ -211,41 +314,133 @@ async function createServer() {
 
     const resolvedFiles = files.map((file: { path: string; name: string }) => {
       let localPath = "";
-      if (file.path.startsWith("/outputs/")) {
-        localPath = path.join(writableBase, "outputs", file.path.replace("/outputs/", ""));
-      } else if (file.path.includes("path=")) {
-        try {
-          const url = new URL(file.path, "http://localhost");
-          const queryPath = url.searchParams.get("path");
-          if (queryPath) {
-            localPath = path.resolve(writableBase, queryPath);
-          }
-        } catch (e) {
-          console.error("URL parsing error:", e);
+      let resolvedQueryPath = "";
+
+      // 1. If it contains "path=" (e.g. /api/download?path=outputs%2Ffile.png or http://domain/api/download?path=outputs%2Ffile.png)
+      if (file.path && file.path.includes("path=")) {
+        const match = file.path.match(/[?&]path=([^&]+)/);
+        if (match && match[1]) {
+          resolvedQueryPath = decodeURIComponent(match[1]);
         }
       }
+
+      // 2. If it contains "/outputs/" or "outputs/" (e.g. /outputs/file.png or http://domain/outputs/file.png)
+      if (!resolvedQueryPath && file.path) {
+        if (file.path.includes("/outputs/")) {
+          resolvedQueryPath = "outputs/" + file.path.split("/outputs/")[1];
+        } else if (file.path.includes("outputs/")) {
+          resolvedQueryPath = "outputs/" + file.path.split("outputs/")[1];
+        }
+      }
+
+      // 3. Fallback to just the filename if nothing else matched
+      if (!resolvedQueryPath && file.path) {
+        resolvedQueryPath = "outputs/" + path.basename(file.path);
+      }
+
+      // Resolve against writableBase
+      if (resolvedQueryPath) {
+        // Clean any leading slashes to prevent path.resolve/join from interpreting it as root
+        const cleanPath = resolvedQueryPath.replace(/^\/+/, "");
+        localPath = path.resolve(writableBase, cleanPath);
+      }
+
+      // Robust fallback search: if the file is not found at the primary resolved location,
+      // use our findFuzzyFile helper to locate it regardless of exact casing, space encoding, or unicode differences
+      if (!localPath || !fs.existsSync(localPath)) {
+        const fuzzyPath = findFuzzyFile(localPath || file.path);
+        if (fuzzyPath) {
+          console.log(`ZIP matching fuzzy resolved: ${file.path} -> ${fuzzyPath}`);
+          localPath = fuzzyPath;
+        }
+      }
+
+      console.log(`ZIP mapping file item: name=[${file.name}], inputPath=[${file.path}] -> localPath=[${localPath}] (exists: ${localPath ? fs.existsSync(localPath) : false})`);
       return { ...file, localPath };
     });
 
     const existingFiles = resolvedFiles.filter(f => f.localPath && fs.existsSync(f.localPath));
+    console.log(`ZIP files resolution summary: total requested=[${resolvedFiles.length}], found on disk=[${existingFiles.length}]`);
     
     if (existingFiles.length === 0) {
-      return res.status(404).json({ error: "None of the requested files were found on the server. They may have been moved or deleted." });
+      console.error("ZIP Error: None of the resolved paths exist on the filesystem. Resolved files:", resolvedFiles);
+      return res.status(404).json({ 
+        error: "None of the requested files were found on the server. They may have been moved or deleted.",
+        resolved: resolvedFiles.map(r => ({ path: r.path, resolved: r.localPath }))
+      });
     }
 
-    const archive = archiver("zip", { zlib: { level: 9 } });
-    const name = zipName || `upscaled_images_${Date.now()}.zip`;
+    const outputsDir = path.join(writableBase, "outputs");
+    if (!fs.existsSync(outputsDir)) {
+      try {
+        fs.mkdirSync(outputsDir, { recursive: true });
+      } catch (e) {
+        console.error("Failed to create outputs directory for ZIP:", e);
+      }
+    }
 
-    res.attachment(name);
+    const tempZipFilename = `upscaled_${Date.now()}_${Math.round(Math.random() * 1e9)}.zip`;
+    const tempZipPath = path.join(outputsDir, tempZipFilename);
+
+    const outputStream = fs.createWriteStream(tempZipPath);
+    const archive = archiver("zip", { zlib: { level: 1 } });
+
+    outputStream.on("close", async () => {
+      const sizeOnDisk = fs.existsSync(tempZipPath) ? fs.statSync(tempZipPath).size : 0;
+      console.log(`ZIP generated successfully on disk: ${tempZipPath}. size=[${sizeOnDisk} bytes], archivePointer=[${archive.pointer()} bytes]`);
+      
+      try {
+        // Validate entry counts and file integrity via unzipper
+        if (sizeOnDisk < 22) {
+          throw new Error("Created ZIP archive is empty or 0 bytes.");
+        }
+
+        const directory = await unzipper.Open.file(tempZipPath);
+        console.log(`ZIP download-ready integrity check: ${directory.files.length} archive files verified:`);
+        directory.files.forEach((f) => {
+          console.log(`  - "${f.path}" (${f.uncompressedSize} bytes)`);
+        });
+
+        if (directory.files.length === 0) {
+          throw new Error("Created ZIP contains zero entries.");
+        }
+
+        const relativePath = `outputs/${tempZipFilename}`;
+        const downloadPath = `/api/download?path=${encodeURIComponent(relativePath)}`;
+        res.json({ success: true, url: downloadPath });
+      } catch (err: any) {
+        console.error("ZIP Verification Failure:", err.message);
+        
+        // Cleanup the corrupt or empty ZIP
+        try {
+          if (fs.existsSync(tempZipPath)) {
+            fs.unlinkSync(tempZipPath);
+          }
+        } catch (cleanupErr) {
+          console.error("Cleanup of corrupted ZIP failed:", cleanupErr);
+        }
+
+        if (!res.headersSent) {
+          res.status(500).json({ error: `ZIP file generation validation error: ${err.message}` });
+        }
+      }
+    });
+
+    outputStream.on("error", (err) => {
+      console.error("ZIP write stream error:", err);
+      if (!res.headersSent) {
+        res.status(500).json({ error: `Failed to write ZIP file: ${err.message}` });
+      }
+    });
 
     archive.on("error", (err) => {
       console.error("Archiver error:", err);
       if (!res.headersSent) {
-        res.status(500).send({ error: err.message });
+        res.status(500).json({ error: err.message });
       }
     });
 
-    archive.pipe(res);
+    archive.pipe(outputStream);
 
     const missingFiles: string[] = [];
     
@@ -254,17 +449,19 @@ async function createServer() {
         try {
           fs.accessSync(file.localPath, fs.constants.R_OK);
           archive.file(file.localPath, { name: file.name });
-        } catch (e) {
+          console.log(`Archiving file added: Name=[${file.name}], Source=[${file.localPath}]`);
+        } catch (e: any) {
           console.error(`File unreadable: ${file.localPath}`, e);
-          missingFiles.push(`${file.name} (Unreadable)`);
+          missingFiles.push(`${file.name} (Unreadable/Read permissions error)`);
         }
       } else {
-        missingFiles.push(`${file.name} (Not found)`);
+        console.warn(`File missing for zipping: Name=[${file.name}], Expected Path=[${file.localPath || file.path}]`);
+        missingFiles.push(`${file.name} (Not found on server disk)`);
       }
     });
 
     if (missingFiles.length > 0) {
-      const report = `The following files could not be included in this ZIP:\n\n${missingFiles.join("\n")}\n\nThis usually happens if the files were deleted or the output directory was changed.`;
+      const report = `The following files could not be included in this ZIP:\n\n${missingFiles.join("\n")}\n\nPossible cause: File was not fully written, changed output directories, or deleted.`;
       archive.append(report, { name: "MISSING_FILES_REPORT.txt" });
     }
 
@@ -425,15 +622,27 @@ export const config = {
   },
 };
 
-// For local development
-if (process.env.NODE_ENV !== "production") {
+// For standalone servers (Docker, Cloud Run, Local), boot on port 3000
+const isVercel = process.env.VERCEL === "1" || !!process.env.VERCEL;
+if (!isVercel) {
   serverPromise.then(({ server }) => {
     const PORT = 3000;
     server.listen(PORT, "0.0.0.0", () => {
       console.log(`Server running on http://localhost:${PORT}`);
     });
+  }).catch(err => {
+    console.error("Failed to start server:", err);
   });
 }
+
+// Global exception guards to prevent EPIPE/ECONNRESET or stream aborts from crashing Node
+process.on("uncaughtException", (err: any) => {
+  console.error("CRITICAL: Uncaught Exception caught:", err);
+});
+
+process.on("unhandledRejection", (reason: any, promise: Promise<any>) => {
+  console.error("CRITICAL: Unhandled Rejection at:", promise, "reason:", reason);
+});
 
 async function processBatch(batchId: string, files: any[], scale: string, format: string, io: any, writableBase: string, customPath?: string, settings?: any) {
   let completed = 0;

@@ -1,0 +1,10 @@
+# Netlify configuration for Single Page Applications (SPA) and optional API redirection
+[build]
+  publish = "dist"
+  command = "npm run build"
+
+# Fallback path redirection for React Router / SPA routing
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200

@@ -30,6 +30,17 @@ import {
 import { motion, AnimatePresence } from 'motion/react';
 import { io, Socket } from 'socket.io-client';
 
+const getApiUrl = (url: string) => {
+  if (!url) return '';
+  if (url.startsWith('http://') || url.startsWith('https://') || url.startsWith('data:')) {
+    return url;
+  }
+  const base = (import.meta as any).env.VITE_API_URL || '';
+  const cleanBase = base.endsWith('/') ? base.slice(0, -1) : base;
+  const cleanUrl = url.startsWith('/') ? url : `/${url}`;
+  return `${cleanBase}${cleanUrl}`;
+};
+
 interface UploadedFile {
   id: string;
   name: string;
@@ -209,6 +220,13 @@ export default function App() {
   const [outputPath, setOutputPath] = useState<string>('outputs');
   const [selectedPreview, setSelectedPreview] = useState<UploadedFile | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [isZipping, setIsZipping] = useState(false);
+  const [zipMessage, setZipMessage] = useState("");
+  const filesRef = useRef<UploadedFile[]>([]);
+
+  useEffect(() => {
+    filesRef.current = files;
+  }, [files]);
   
   // Manual Quality Controls
   const [sharpenStrength, setSharpenStrength] = useState<number>(40);
@@ -229,7 +247,7 @@ export default function App() {
   useEffect(() => {
     const checkHealth = async () => {
       try {
-        const res = await fetch('/api/health');
+        const res = await fetch(getApiUrl('/api/health'));
         setIsSystemReady(res.ok);
       } catch (e) {
         setIsSystemReady(false);
@@ -241,7 +259,8 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    socketRef.current = io();
+    const socketUrl = (import.meta as any).env.VITE_API_URL || '';
+    socketRef.current = io(socketUrl || undefined);
 
     socketRef.current.on('progress', (data) => {
       setFiles(prev => prev.map(f => {
@@ -280,14 +299,14 @@ export default function App() {
     if (!selectedPreview) return;
     // If already completed, use the actual output path (with inline=true)
     if (selectedPreview.status === 'completed' && selectedPreview.outputPath) {
-      setUpscaledPreviewUrl(`${selectedPreview.outputPath}&inline=true`);
+      setUpscaledPreviewUrl(getApiUrl(`${selectedPreview.outputPath}&inline=true`));
       setIsPreviewLoading(false);
       return;
     }
 
     setIsPreviewLoading(true);
     try {
-      const res = await fetch('/api/preview', {
+      const res = await fetch(getApiUrl('/api/preview'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -334,7 +353,7 @@ export default function App() {
     newFiles.forEach(file => formData.append('images', file));
 
     try {
-      const response = await fetch('/api/upload', {
+      const response = await fetch(getApiUrl('/api/upload'), {
         method: 'POST',
         body: formData,
       });
@@ -360,7 +379,7 @@ export default function App() {
       
       const uploaded: UploadedFile[] = (data.files as any[]).map((f: any) => ({
         ...f,
-        previewUrl: `/uploads/${f.id}`,
+        previewUrl: getApiUrl(`/uploads/${f.id}`),
         width: f.width,
         height: f.height,
         status: 'idle',
@@ -379,7 +398,7 @@ export default function App() {
     setIsProcessing(true);
     
     try {
-      const response = await fetch('/api/process', {
+      const response = await fetch(getApiUrl('/api/process'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ 
@@ -418,7 +437,7 @@ export default function App() {
   const stopProcessing = async () => {
     if (!batchId) return;
     try {
-      const response = await fetch('/api/stop', {
+      const response = await fetch(getApiUrl('/api/stop'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ batchId }),
@@ -437,21 +456,111 @@ export default function App() {
     }
   };
 
-  const downloadAsZip = async (filesToZip: UploadedFile[], zipName?: string) => {
-    const filesToProcess = filesToZip
-      .filter(f => f.status === 'completed' && f.outputPath)
-      .map(f => {
-        const fileNameWithoutExt = f.name.substring(0, f.name.lastIndexOf('.')) || f.name;
-        return {
-          path: f.outputPath!,
-          name: `${fileNameWithoutExt}_upscaled.${format.toLowerCase()}`
-        };
-      });
+  const triggerFileDownload = async (url: string, filename: string) => {
+    try {
+      const response = await fetch(url);
+      if (!response.ok) throw new Error(`HTTP error ${response.status}`);
+      const blob = await response.blob();
+      const blobUrl = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = blobUrl;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(blobUrl);
+    } catch (err) {
+      console.warn("Secure Blob-based download failed, falling back to direct current-window download handler", err);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+    }
+  };
 
-    if (filesToProcess.length === 0) return;
+  const downloadAsZip = async (filesToZip: UploadedFile[], zipName?: string) => {
+    if (filesToZip.length === 0) return;
+
+    // Check if any requested files are currently processing or idle
+    const runningFiles = filesToZip.filter(f => f.status === 'idle' || f.status === 'processing');
+    
+    if (runningFiles.length > 0) {
+      console.log(`ZIP request: waiting for ${runningFiles.length} active upscales to finish.`);
+      setIsZipping(true);
+      setZipMessage(`Preparing ZIP archive... Waiting for ${runningFiles.length} images to finish upscaling...`);
+
+      // Poll until none of our target files are idle or processing
+      const targetIds = filesToZip.map(f => f.id);
+      
+      try {
+        await new Promise<void>((resolve, reject) => {
+          const timeout = setTimeout(() => {
+            clearInterval(interval);
+            reject(new Error("Timeout waiting for upscale operations to complete. Please try downloading again."));
+          }, 300000); // 5 minutes timeout max
+
+          const interval = setInterval(() => {
+            const currentFiles = filesRef.current;
+            const activeCount = currentFiles.filter(f => 
+              targetIds.includes(f.id) && (f.status === 'idle' || f.status === 'processing')
+            ).length;
+
+            if (activeCount === 0) {
+              clearTimeout(timeout);
+              clearInterval(interval);
+              resolve();
+            } else {
+              setZipMessage(`Preparing ZIP archive... Waiting for ${activeCount} images to finish upscaling...`);
+            }
+          }, 500);
+        });
+      } catch (err: any) {
+        setIsZipping(false);
+        alert(err.message);
+        return;
+      }
+    }
+
+    // Now get the latest completed files from filesRef
+    setIsZipping(true);
+    setZipMessage("Compiling ZIP file on the server...");
+
+    const targetIds = filesToZip.map(f => f.id);
+    const completedFiles = filesRef.current.filter(f => 
+      targetIds.includes(f.id) && f.status === 'completed' && f.outputPath
+    );
+
+    if (completedFiles.length === 0) {
+      setIsZipping(false);
+      alert("ZIP creation failed: No successfully upscaled images were found.");
+      return;
+    }
+
+    const filesToProcess = completedFiles.map(f => {
+      let parsedName = '';
+      if (f.outputPath) {
+        const match = f.outputPath.match(/[?&]path=([^&]+)/);
+        if (match && match[1]) {
+          const decodedPath = decodeURIComponent(match[1]);
+          parsedName = decodedPath.split('/').pop() || '';
+        }
+      }
+      if (!parsedName) {
+        const fileNameWithoutExt = f.name.substring(0, f.name.lastIndexOf('.')) || f.name;
+        parsedName = `${fileNameWithoutExt}_upscaled.${format.toLowerCase()}`;
+      }
+      return {
+        path: f.outputPath!,
+        name: parsedName
+      };
+    });
 
     try {
-      const response = await fetch('/api/download-zip', {
+      console.log(`Sending zip compilation request for ${filesToProcess.length} files:`, filesToProcess);
+      
+      const response = await fetch(getApiUrl('/api/download-zip'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ files: filesToProcess, zipName }),
@@ -462,18 +571,22 @@ export default function App() {
         throw new Error(errorData.error || 'Failed to generate ZIP');
       }
 
-      const blob = await response.blob();
-      const url = window.URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = zipName || `upscaled_batch_${Date.now()}.zip`;
-      document.body.appendChild(a);
-      a.click();
-      window.URL.revokeObjectURL(url);
-      document.body.removeChild(a);
+      const data = await response.json();
+      if (!data.success || !data.url) {
+        throw new Error(data.error || 'Server did not return a download URL');
+      }
+
+      setZipMessage("ZIP verified successfully! Initiating download...");
+      
+      const preferredName = zipName || `upscaled_batch_${Date.now()}.zip`;
+      const downloadUrl = getApiUrl(`${data.url}&name=${encodeURIComponent(preferredName)}`);
+      
+      await triggerFileDownload(downloadUrl, preferredName);
     } catch (error: any) {
       console.error('ZIP download failed:', error);
       alert(`ZIP download failed: ${error.message}`);
+    } finally {
+      setIsZipping(false);
     }
   };
 
@@ -624,14 +737,18 @@ export default function App() {
                                 >
                                   <Eye className="w-3.5 h-3.5" />
                                 </button>
-                                <a 
-                                  href={file.outputPath} 
-                                  download={`${file.name.substring(0, file.name.lastIndexOf('.')) || file.name}_upscaled_${scale}x.${format.toLowerCase()}`}
+                                <button 
+                                  onClick={() => {
+                                    const rawName = file.name;
+                                    const cleanName = rawName.substring(0, rawName.lastIndexOf('.')) || rawName;
+                                    const downloadFilename = `${cleanName}_upscaled_${scale}x.${format.toLowerCase()}`;
+                                    triggerFileDownload(getApiUrl(file.outputPath || ''), downloadFilename);
+                                  }}
                                   title="Download Image"
                                   className="p-1.5 bg-emerald-500 rounded-md text-black hover:bg-emerald-400 transition-colors"
                                 >
                                   <Download className="w-3.5 h-3.5" />
-                                </a>
+                                </button>
                                 <button 
                                   onClick={() => {
                                     const fileNameWithoutExt = file.name.substring(0, file.name.lastIndexOf('.')) || file.name;
@@ -1066,6 +1183,37 @@ export default function App() {
                     Done
                   </button>
                 </div>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+
+        {isZipping && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/85 backdrop-blur-md"
+          >
+            <motion.div
+              initial={{ scale: 0.95, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.95, opacity: 0 }}
+              className="bg-[#0f0f0f] border border-white/10 rounded-3xl p-8 max-w-sm w-full shadow-2xl flex flex-col items-center text-center space-y-5"
+            >
+              <div className="relative">
+                <div className="w-16 h-16 rounded-full border-4 border-emerald-500/10 border-t-emerald-500 animate-spin flex items-center justify-center" />
+                <Download className="w-6 h-6 text-emerald-500 absolute inset-0 m-auto animate-pulse" />
+              </div>
+              <div className="space-y-2">
+                <h3 className="font-bold text-lg text-white">ZIP Archive Processing</h3>
+                <p className="text-xs text-zinc-400 font-medium leading-relaxed min-h-[40px] px-2">
+                  {zipMessage}
+                </p>
+              </div>
+              <div className="w-full h-px bg-white/5" />
+              <div className="text-[10px] text-zinc-500 font-mono tracking-wider bg-white/5 px-3 py-1.5 rounded-xl border border-white/5">
+                STATUS: PREPARING_METADATA
               </div>
             </motion.div>
           </motion.div>
